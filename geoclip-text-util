@@ -1,93 +1,312 @@
 import torch
+import torch.nn.functional as F
+from PIL import Image
 from geoclip import GeoCLIP, LocationEncoder
 from transformers import CLIPTokenizer
+import time
+import os
+import psutil
 import numpy as np
-from PIL import Image
-import torchvision.transforms as T
+from typing import Union, List, Tuple, Dict, Any, Optional
+from dataclasses import dataclass
+import platform
 
-# Initialize GeoCLIP and tokenizer
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = GeoCLIP().to(device)
-tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+@dataclass
+class InferenceMetrics:
+    """Structured metrics for GeoCLIP inference"""
+    inference_time: float  # seconds
+    memory_used: float  # MB
+    gpu_memory_used: Optional[float]  # MB
+    cpu_percent: float  # %
+    batch_size: int
+    input_type: str  # "image" or "text"
+    throughput: float  # queries/second
 
-# Image preprocessing (based on CLIP standards, inferred from GeoCLIP's CLIP-inspired design)
-image_transform = T.Compose([
-    T.Resize((224, 224)),  # Standard CLIP input size
-    T.ToTensor(),
-    T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], 
-                std=[0.26862954, 0.26130258, 0.27577711])
-])
-
-class GeoReasoningParser:
-    def __init__(self, device=None):
-        """Initialize GeoCLIP utilities for processing geospatial reasoning data."""
-        if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = device
-        
+class GeoCLIPAPI:
+    """Enhanced GeoCLIP API with performance metrics and resource tracking"""
+    
+    def __init__(self, device=None, precompute_gallery=True):
+        """Initialize GeoCLIP model, tokenizer and resources"""
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if device is None else device
         self.model = GeoCLIP().to(self.device)
         self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-    
-    def encode_text(self, text):
-        """Extract normalized text embeddings using GeoCLIP's CLIP text encoder."""
-        with torch.no_grad():
-            inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True).to(self.device)
-            text_features = self.model.image_encoder.CLIP.get_text_features(**inputs)
-            text_embeddings = self.model.image_encoder.mlp(text_features)
-            text_embeddings = torch.nn.functional.normalize(text_embeddings, dim=1)
-        return text_embeddings.cpu().numpy()
-    
-    def encode_gps(self, coordinates):
-        """Encode GPS coordinates into GeoCLIP's location embedding space."""
-        if not isinstance(coordinates, torch.Tensor):
-            coordinates = torch.tensor(coordinates, dtype=torch.float32)
-        coordinates = coordinates.to(self.device)
-        if coordinates.dim() == 1:  # Check if tensor is 1-dimensional
-            coordinates = coordinates.unsqueeze(0)  # Add a dimension at the beginning
-        with torch.no_grad():
-            embeddings = self.model.location_encoder(coordinates)
-            embeddings = torch.nn.functional.normalize(embeddings, dim=1)
+        self.location_encoder = LocationEncoder().to(self.device)
         
-        return embeddings.cpu().numpy()
+        # System info
+        self.has_gpu = torch.cuda.is_available()
+        self.system_info = {
+            "platform": platform.system(),
+            "processor": platform.processor(),
+            "python_version": platform.python_version(),
+            "torch_version": torch.__version__,
+            "gpu": torch.cuda.get_device_name(0) if self.has_gpu else "None"
+        }
+        
+        # Precompute gallery for faster inference
+        if precompute_gallery:
+            start = time.time()
+            with torch.no_grad():
+                self.gallery = self.model.gps_gallery.to(self.device)
+                self.gallery_features = F.normalize(self.model.location_encoder(self.gallery), dim=1)
+            print(f"Precomputed gallery features in {time.time()-start:.3f}s")
     
-    def process_geo_reasoning_data(self, geo_reasoning_data):
-        """Extract and encode location and text embeddings from geospatial reasoning data."""
+    def _get_resource_usage(self) -> Dict[str, float]:
+        """Get current resource usage"""
+        metrics = {
+            "memory_used": psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024),  # MB
+            "cpu_percent": psutil.cpu_percent(),
+        }
+        
+        if self.has_gpu:
+            try:
+                gpu_memory = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
+                metrics["gpu_memory_used"] = gpu_memory
+            except Exception as e:
+                metrics["gpu_memory_used"] = None
+        else:
+            metrics["gpu_memory_used"] = None
+            
+        return metrics
+    
+    @torch.no_grad()
+    def predict(self, query: Union[str, List[str], Image.Image], top_k: int = 5, 
+                return_metrics: bool = True) -> Dict[str, Any]:
+        """
+        Unified prediction method handling both images and text with performance metrics
+        
+        Args:
+            query: Image path, PIL image, text query, or list of queries
+            top_k: Number of predictions to return
+            return_metrics: Whether to return performance metrics
+            
+        Returns:
+            Dictionary with predictions and optional performance metrics
+        """
+        batch_size = 1
+        input_type = None
+        
+        # Determine input type and prepare batch
+        if isinstance(query, list):
+            batch_size = len(query)
+            if all(isinstance(q, str) for q in query):
+                # Check if strings are file paths or text queries
+                if all(os.path.exists(q) for q in query):
+                    input_type = "image"
+                else:
+                    input_type = "text"
+            elif all(isinstance(q, Image.Image) for q in query):
+                input_type = "image"
+        elif isinstance(query, str):
+            if os.path.exists(query) and query.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                input_type = "image"
+            else:
+                input_type = "text"
+        elif isinstance(query, Image.Image):
+            input_type = "image"
+        
+        if input_type is None:
+            raise ValueError("Query must be an image path, PIL image, text query, or list of either")
+        
+        # Capture starting resource metrics
+        start_resources = self._get_resource_usage()
+        start_time = time.time()
+        
+        # Perform prediction based on input type
+        if input_type == "image":
+            predictions = self._predict_from_image(query, top_k)
+        else:
+            predictions = self._predict_from_text(query, top_k)
+        
+        # Calculate metrics
+        inference_time = time.time() - start_time
+        end_resources = self._get_resource_usage()
+        
+        result = {"predictions": predictions}
+        
+        if return_metrics:
+            metrics = InferenceMetrics(
+                inference_time=inference_time,
+                memory_used=end_resources["memory_used"] - start_resources["memory_used"],
+                gpu_memory_used=end_resources.get("gpu_memory_used", None),
+                cpu_percent=end_resources["cpu_percent"],
+                batch_size=batch_size,
+                input_type=input_type,
+                throughput=batch_size / inference_time
+            )
+            result["metrics"] = metrics
+            
+        return result
+    
+    def _predict_from_image(self, query: Union[str, Image.Image, List[Union[str, Image.Image]]], 
+                           top_k: int = 5) -> List[Dict[str, Any]]:
+        """Internal method to predict from images"""
+        if not isinstance(query, list):
+            query = [query]
+            
         results = []
-        
-        for entry in geo_reasoning_data:
-            question_embedding = self.encode_text(entry["question"])
-            answer_embedding = self.encode_text(entry["answer"])
-            
-            location_embeddings = []
-            for step in entry["cot_steps"]:
-                step_embedding = self.encode_text(step["step"])
-                step_locations = [self.encode_gps([loc["latitude"], loc["longitude"]]) for loc in step["locations"]]
-                location_embeddings.append((step_embedding, step_locations))
-            
-            results.append({
-                "question_embedding": question_embedding,
-                "answer_embedding": answer_embedding,
-                "steps": location_embeddings
-            })
+        for q in query:
+            try:
+                # Handle image path or PIL image
+                if isinstance(q, str):
+                    img = Image.open(q).convert("RGB")
+                    source = q
+                else:
+                    img = q
+                    source = "PIL_Image"
+                
+                # Preprocess and get predictions
+                img_tensor = self.model.image_encoder.preprocess_image(img).to(self.device)
+                image_features = F.normalize(self.model.image_encoder(img_tensor), dim=1)
+                
+                # Calculate similarity with precomputed gallery
+                similarity = self.model.logit_scale.exp() * (image_features @ self.gallery_features.T)
+                probs = similarity.softmax(dim=-1)
+                top_indices = torch.topk(probs[0], top_k)
+                
+                # Format results
+                predictions = []
+                for idx, prob in zip(top_indices.indices, top_indices.values):
+                    coords = self.gallery[idx].cpu().numpy()
+                    predictions.append({
+                        "lat": float(coords[0]),
+                        "lon": float(coords[1]),
+                        "probability": float(prob)
+                    })
+                
+                results.append({
+                    "source": source,
+                    "locations": predictions
+                })
+                
+            except Exception as e:
+                results.append({
+                    "source": str(q) if isinstance(q, str) else "PIL_Image",
+                    "error": str(e)
+                })
         
         return results
+    
+    def _predict_from_text(self, query: Union[str, List[str]], top_k: int = 5) -> List[Dict[str, Any]]:
+        """Internal method to predict from text"""
+        if not isinstance(query, list):
+            query = [query]
+            
+        results = []
+        for q in query:
+            try:
+                # Process text query
+                inputs = self.tokenizer(q, return_tensors="pt", padding=True, truncation=True).to(self.device)
+                text_features = self.model.image_encoder.CLIP.get_text_features(**inputs)
+                text_features = F.normalize(self.model.image_encoder.mlp(text_features), dim=1)
+                
+                # Calculate similarity with precomputed gallery
+                similarity = self.model.logit_scale.exp() * (text_features @ self.gallery_features.T)
+                probs = similarity.softmax(dim=-1)
+                top_indices = torch.topk(probs[0], top_k)
+                
+                # Format results
+                predictions = []
+                for idx, prob in zip(top_indices.indices, top_indices.values):
+                    coords = self.gallery[idx].cpu().numpy()
+                    predictions.append({
+                        "lat": float(coords[0]),
+                        "lon": float(coords[1]),
+                        "probability": float(prob)
+                    })
+                
+                results.append({
+                    "source": q,
+                    "locations": predictions
+                })
+                
+            except Exception as e:
+                results.append({
+                    "source": q,
+                    "error": str(e)
+                })
+        
+        return results
+    
+    def encode_gps(self, coordinates: Union[np.ndarray, torch.Tensor, List[List[float]]]) -> torch.Tensor:
+        """
+        Encode GPS coordinates into 512-dimensional embedding space
+        
+        Args:
+            coordinates: Array of lat/lon pairs with shape (n, 2)
+            
+        Returns:
+            Normalized embeddings with shape (n, 512)
+        """
+        start = time.time()
+        if not isinstance(coordinates, torch.Tensor):
+            coordinates = torch.tensor(coordinates, dtype=torch.float32)
+        
+        with torch.no_grad():
+            embeddings = F.normalize(self.location_encoder(coordinates.to(self.device)), dim=1)
+        
+        print(f"Encoded {len(coordinates)} coordinates in {time.time()-start:.3f}s")
+        return embeddings
+    
+    def compare_locations(self, coordinates: Union[np.ndarray, torch.Tensor, List[List[float]]]) -> np.ndarray:
+        """
+        Compute similarity matrix between locations
+        
+        Args:
+            coordinates: Array of lat/lon pairs with shape (n, 2)
+            
+        Returns:
+            n×n similarity matrix
+        """
+        embeddings = self.encode_gps(coordinates)
+        similarity = (embeddings @ embeddings.T).cpu().numpy()
+        return similarity
 
-# Example usage
-grp = GeoReasoningParser()
-geo_reasoning_data = [
-    {
-        "question": "Where should emergency response teams be pre-positioned for disaster relief?",
-        "location": {"latitude": 35.6895, "longitude": 139.6917},
-        "cot_steps": [
-            {"step": "Identify Tokyo, Japan, as a central logistics hub.", "locations": [{"latitude": 35.6895, "longitude": 139.6917}]},
-            {"step": "Assess vulnerability—high seismic activity necessitates rapid response hubs.", "locations": [{"latitude": 35.6895, "longitude": 139.6917}]},
-            {"step": "Consider logistics—proximity to major transportation routes ensures accessibility.", "locations": [{"latitude": 35.6895, "longitude": 139.6917}]},
-            {"step": "Conclude—Tokyo is optimal for disaster response staging.", "locations": [{"latitude": 35.6895, "longitude": 139.6917}]}
-        ],
-        "answer": "Tokyo, Japan, due to its centralized logistics and disaster response capabilities."
-    }
-]
+def pretty_print_predictions(predictions: List[Dict[str, Any]], title: str):
+    """
+    Nicely format and print prediction results.
+    """
+    for result in predictions:
+        source = result.get("source", "Unknown")
+        locations = result.get("locations", [])
+        print(f"{title}:")
+        print(f"[*]- {source} - Top {len(locations)} (")
+        for i, loc in enumerate(locations, start=1):
+            lat, lon, prob = loc['lat'], loc['lon'], loc['probability']
+            print(f"  {i}. ({lat:.6f}, {lon:.6f}) - {prob:.6f}")
+        print(")\n")
 
-encoded_results = grp.process_geo_reasoning_data(geo_reasoning_data)
-print(encoded_results)
+def pretty_print_metrics(metrics: InferenceMetrics):
+    """
+    Nicely format and print performance metrics.
+    """
+    print("Performance Metrics:")
+    print(f"  Inference time: {metrics.inference_time:.3f} s")
+    print(f"  Memory used: {metrics.memory_used:.2f} MB")
+    if metrics.gpu_memory_used is not None:
+        print(f"  GPU memory used: {metrics.gpu_memory_used:.2f} MB")
+    print(f"  CPU usage: {metrics.cpu_percent:.1f} %")
+    print(f"  Throughput: {metrics.throughput:.2f} queries/s\n")
+
+# End-to-end usage example
+if __name__ == "__main__":
+    # Initialize API
+    api = GeoCLIPAPI()
+    
+    # Print system information
+    print("System Information:")
+    for key, value in api.system_info.items():
+        print(f"  {key}: {value}")
+    print("\n")
+    
+    # Improved image prediction output
+    image_path = "/content/ellis.jpg"
+    if os.path.exists(image_path):
+        result = api.predict(image_path, return_metrics=True)
+        pretty_print_predictions(result["predictions"], "Location")
+        pretty_print_metrics(result["metrics"])
+    
+    # Improved text prediction output
+    text_query = "mountain landscape with snow peaks"
+    result = api.predict(text_query, return_metrics=True)
+    pretty_print_predictions(result["predictions"], "Location")
+    pretty_print_metrics(result["metrics"])
