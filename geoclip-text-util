@@ -1,0 +1,93 @@
+import torch
+from geoclip import GeoCLIP, LocationEncoder
+from transformers import CLIPTokenizer
+import numpy as np
+from PIL import Image
+import torchvision.transforms as T
+
+# Initialize GeoCLIP and tokenizer
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = GeoCLIP().to(device)
+tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+
+# Image preprocessing (based on CLIP standards, inferred from GeoCLIP's CLIP-inspired design)
+image_transform = T.Compose([
+    T.Resize((224, 224)),  # Standard CLIP input size
+    T.ToTensor(),
+    T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], 
+                std=[0.26862954, 0.26130258, 0.27577711])
+])
+
+class GeoReasoningParser:
+    def __init__(self, device=None):
+        """Initialize GeoCLIP utilities for processing geospatial reasoning data."""
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
+        
+        self.model = GeoCLIP().to(self.device)
+        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+    
+    def encode_text(self, text):
+        """Extract normalized text embeddings using GeoCLIP's CLIP text encoder."""
+        with torch.no_grad():
+            inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True).to(self.device)
+            text_features = self.model.image_encoder.CLIP.get_text_features(**inputs)
+            text_embeddings = self.model.image_encoder.mlp(text_features)
+            text_embeddings = torch.nn.functional.normalize(text_embeddings, dim=1)
+        return text_embeddings.cpu().numpy()
+    
+    def encode_gps(self, coordinates):
+        """Encode GPS coordinates into GeoCLIP's location embedding space."""
+        if not isinstance(coordinates, torch.Tensor):
+            coordinates = torch.tensor(coordinates, dtype=torch.float32)
+        coordinates = coordinates.to(self.device)
+        if coordinates.dim() == 1:  # Check if tensor is 1-dimensional
+            coordinates = coordinates.unsqueeze(0)  # Add a dimension at the beginning
+        with torch.no_grad():
+            embeddings = self.model.location_encoder(coordinates)
+            embeddings = torch.nn.functional.normalize(embeddings, dim=1)
+        
+        return embeddings.cpu().numpy()
+    
+    def process_geo_reasoning_data(self, geo_reasoning_data):
+        """Extract and encode location and text embeddings from geospatial reasoning data."""
+        results = []
+        
+        for entry in geo_reasoning_data:
+            question_embedding = self.encode_text(entry["question"])
+            answer_embedding = self.encode_text(entry["answer"])
+            
+            location_embeddings = []
+            for step in entry["cot_steps"]:
+                step_embedding = self.encode_text(step["step"])
+                step_locations = [self.encode_gps([loc["latitude"], loc["longitude"]]) for loc in step["locations"]]
+                location_embeddings.append((step_embedding, step_locations))
+            
+            results.append({
+                "question_embedding": question_embedding,
+                "answer_embedding": answer_embedding,
+                "steps": location_embeddings
+            })
+        
+        return results
+
+# Example usage
+grp = GeoReasoningParser()
+geo_reasoning_data = [
+    {
+        "question": "Where should emergency response teams be pre-positioned for disaster relief?",
+        "location": {"latitude": 35.6895, "longitude": 139.6917},
+        "cot_steps": [
+            {"step": "Identify Tokyo, Japan, as a central logistics hub.", "locations": [{"latitude": 35.6895, "longitude": 139.6917}]},
+            {"step": "Assess vulnerability—high seismic activity necessitates rapid response hubs.", "locations": [{"latitude": 35.6895, "longitude": 139.6917}]},
+            {"step": "Consider logistics—proximity to major transportation routes ensures accessibility.", "locations": [{"latitude": 35.6895, "longitude": 139.6917}]},
+            {"step": "Conclude—Tokyo is optimal for disaster response staging.", "locations": [{"latitude": 35.6895, "longitude": 139.6917}]}
+        ],
+        "answer": "Tokyo, Japan, due to its centralized logistics and disaster response capabilities."
+    }
+]
+
+encoded_results = grp.process_geo_reasoning_data(geo_reasoning_data)
+print(encoded_results)
