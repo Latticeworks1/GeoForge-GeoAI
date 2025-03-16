@@ -1,0 +1,538 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+GeoCLIP Training Script (Self-contained)
+"""
+
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+from tqdm.auto import tqdm
+from transformers import CLIPTokenizer, CLIPTextModel
+import random
+import math
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Configuration
+class Config:
+    OUTPUT_DIR = "geoclip_outputs"
+    PER_DEVICE_BATCH_SIZE = 2
+    GRADIENT_ACCUMULATION_STEPS = 4
+    MAX_STEPS = 60
+    LEARNING_RATE = 2e-4
+    WEIGHT_DECAY = 0.01
+    NUM_EPOCHS = 1
+    WARMUP_STEPS = 5
+    LOGGING_STEPS = 1
+    EVAL_STEPS = 10
+    TRAIN_CSV = "/content/landmarks_geospatial_data.csv"
+    VAL_CSV = "location_texts_val.csv"
+
+config = Config()
+
+# Random Fourier Feature encoding
+class GaussianEncoding(nn.Module):
+    """Random Fourier Feature encoding for positional encoding"""
+    def __init__(self, sigma, input_size, encoded_size):
+        super().__init__()
+        self.sigma = sigma
+        self.input_size = input_size
+        self.encoded_size = encoded_size
+        
+        # Create a fixed random matrix for encoding
+        self.register_buffer('B', torch.randn(encoded_size, input_size) * sigma)
+    
+    def forward(self, x):
+        """Apply RFF encoding: [cos(2πBx), sin(2πBx)]"""
+        x_proj = 2 * math.pi * torch.matmul(x, self.B.t())
+        return torch.cat([torch.cos(x_proj), torch.sin(x_proj)], dim=-1)
+
+# Location Encoder (simplified version of GeoCLIP's encoder)
+class LocationEncoder(nn.Module):
+    """Encodes GPS coordinates into high-dimensional representations"""
+    def __init__(self):
+        super().__init__()
+        self.hierarchies = [2**0, 2**4, 2**8]  # Different scales for hierarchical representation
+        
+        # Create encoders for each hierarchy
+        self.encoders = nn.ModuleList()
+        for sigma in self.hierarchies:
+            encoder = nn.Sequential(
+                GaussianEncoding(sigma, 2, 256),
+                nn.Linear(512, 1024),
+                nn.ReLU(),
+                nn.Linear(1024, 1024),
+                nn.ReLU(),
+                nn.Linear(1024, 1024),
+                nn.ReLU(),
+                nn.Linear(1024, 512)
+            )
+            self.encoders.append(encoder)
+    
+    def equal_earth_projection(self, coords):
+        """Apply Equal Earth Projection to GPS coordinates"""
+        # Constants for the projection
+        A1 = 1.340264
+        A2 = -0.081106
+        A3 = 0.000893
+        A4 = 0.003796
+        SF = 66.50336
+        
+        lat, lon = coords[:, 0], coords[:, 1]
+        lat_rad = torch.deg2rad(lat)
+        lon_rad = torch.deg2rad(lon)
+        
+        sin_theta = (torch.sqrt(torch.tensor(3.0, device=coords.device)) / 2) * torch.sin(lat_rad)
+        theta = torch.asin(sin_theta)
+        
+        denominator = 3 * (9 * A4 * theta**8 + 7 * A3 * theta**6 + 3 * A2 * theta**2 + A1)
+        x = (2 * torch.sqrt(torch.tensor(3.0, device=coords.device)) * lon_rad * torch.cos(theta)) / denominator
+        y = A4 * theta**9 + A3 * theta**7 + A2 * theta**3 + A1 * theta
+        
+        return (torch.stack((x, y), dim=1) * SF) / 180
+    
+    def forward(self, coords):
+        """Forward pass through location encoder"""
+        # Apply Equal Earth Projection
+        projected_coords = self.equal_earth_projection(coords)
+        
+        # Get features from each hierarchy level
+        features = torch.zeros(coords.shape[0], 512, device=coords.device)
+        for encoder in self.encoders:
+            features += encoder(projected_coords)
+        
+        return features
+
+# Image Encoder (simplified version - will be unused in this script)
+class ImageEncoder(nn.Module):
+    """Image encoder based on CLIP"""
+    def __init__(self):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(768, 768),
+            nn.ReLU(),
+            nn.Linear(768, 512)
+        )
+    
+    def forward(self, x):
+        """Placeholder forward pass"""
+        return self.mlp(x)
+
+# Simplified GeoCLIP model
+class GeoCLIP(nn.Module):
+    """Simplified GeoCLIP model"""
+    def __init__(self):
+        super().__init__()
+        self.image_encoder = ImageEncoder()
+        self.location_encoder = LocationEncoder()
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        
+    def forward(self, image=None, location=None):
+        """Forward pass"""
+        # Get image features if provided
+        image_features = None
+        if image is not None:
+            image_features = self.image_encoder(image)
+            image_features = F.normalize(image_features, dim=1)
+        
+        # Get location features if provided
+        location_features = None
+        if location is not None:
+            location_features = self.location_encoder(location)
+            location_features = F.normalize(location_features, dim=1)
+        
+        # Return features
+        return image_features, location_features
+
+# Dataset for text-location pairs
+class GeoTextDataset(Dataset):
+    """Dataset for text-location pairs"""
+    def __init__(self, csv_path):
+        self.data = pd.read_csv(csv_path)
+        print(f"Loaded {len(self.data)} samples from {csv_path}")
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        location = torch.tensor([row['lat'], row['lon']], dtype=torch.float32)
+        text = row['description']
+        return location, text
+
+# Text-enhanced GeoCLIP model
+class TextEnhancedGeoCLIP(nn.Module):
+    """GeoCLIP model enhanced with text understanding"""
+    def __init__(self):
+        super().__init__()
+        self.geoclip = GeoCLIP()
+        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+        self.text_model = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
+        self.text_projection = nn.Linear(768, 512)
+        
+        # Freeze text model
+        for param in self.text_model.parameters():
+            param.requires_grad = False
+        
+        # Fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512)
+        )
+    
+    def encode_text(self, texts):
+        """Encode text into embeddings"""
+        inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = self.text_model(**inputs)
+        embeddings = outputs.last_hidden_state[:, 0, :]
+        return self.text_projection(embeddings)
+    
+    def forward(self, locations, texts):
+        """Forward pass with locations and text descriptions"""
+        # Get location features
+        _, location_features = self.geoclip(location=locations)
+        
+        # Get text features
+        text_features = self.encode_text(texts)
+        
+        # Fuse features
+        combined_features = torch.cat([location_features, text_features], dim=1)
+        fused_features = self.fusion(combined_features)
+        
+        # Normalize features
+        fused_features = F.normalize(fused_features, dim=1)
+        
+        return fused_features
+
+# Custom trainer for GeoCLIP
+class GeoCLIPTrainer:
+    """Custom trainer for GeoCLIP with text data"""
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        train_dataset,
+        val_dataset=None,
+        per_device_train_batch_size=16,
+        gradient_accumulation_steps=4,
+        learning_rate=1e-2,
+        weight_decay=0.01,
+        max_steps=None,
+        num_train_epochs=5,
+        warmup_steps=5,
+        logging_steps=1,
+        eval_steps=50,
+        output_dir="outputs",
+        fp16=False,
+        bf16=False,
+    ):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        
+        # Training parameters
+        self.per_device_train_batch_size = per_device_train_batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.max_steps = max_steps
+        self.num_train_epochs = num_train_epochs
+        self.warmup_steps = warmup_steps
+        self.logging_steps = logging_steps
+        self.eval_steps = eval_steps
+        self.output_dir = output_dir
+        self.fp16 = fp16
+        self.bf16 = bf16
+        
+        # Create dataloaders
+        self.train_dataloader = DataLoader(
+            self.train_dataset,
+            batch_size=self.per_device_train_batch_size,
+            shuffle=True
+        )
+        
+        if self.val_dataset:
+            self.val_dataloader = DataLoader(
+                self.val_dataset,
+                batch_size=self.per_device_train_batch_size
+            )
+        
+        # Create optimizer
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )
+        
+        # Create scheduler
+        total_steps = max_steps if max_steps else len(self.train_dataloader) * num_train_epochs
+        self.scheduler = optim.lr_scheduler.LinearLR(
+            self.optimizer,
+            start_factor=1.0,
+            end_factor=0.0,
+            total_iters=total_steps
+        )
+    
+    def train(self):
+        """Train the model"""
+        # Training stats
+        stats = {
+            "train_loss": [],
+            "val_loss": []
+        }
+        
+        # Best validation loss
+        best_val_loss = float('inf')
+        
+        # Create output directory
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        # Training loop
+        global_step = 0
+        for epoch in range(self.num_train_epochs):
+            # Training
+            self.model.train()
+            train_loss = 0.0
+            
+            # Progress bar
+            progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}/{self.num_train_epochs}")
+            
+            for step, batch in enumerate(progress_bar):
+                # Get batch data
+                locations, texts = batch
+                
+                # Move to device
+                locations = locations.to(device)
+                
+                # Forward pass
+                features = self.model(locations, texts)
+                
+                # Compute loss (contrastive)
+                similarity = features @ features.t()
+                targets = torch.arange(similarity.size(0)).to(device)
+                loss = F.cross_entropy(similarity, targets)
+                
+                # Scale loss for gradient accumulation
+                loss = loss / self.gradient_accumulation_steps
+                
+                # Backward pass
+                loss.backward()
+                
+                # Update running loss
+                train_loss += loss.item() * self.gradient_accumulation_steps
+                
+                # Update progress bar
+                progress_bar.set_postfix({"loss": loss.item() * self.gradient_accumulation_steps})
+                
+                # Update parameters if needed
+                if (step + 1) % self.gradient_accumulation_steps == 0:
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
+                    
+                    # Logging
+                    if global_step % self.logging_steps == 0:
+                        stats["train_loss"].append(loss.item() * self.gradient_accumulation_steps)
+                    
+                    # Validation
+                    if self.val_dataset and global_step % self.eval_steps == 0:
+                        val_loss = self.evaluate()
+                        stats["val_loss"].append(val_loss)
+                        
+                        # Save best model
+                        if val_loss < best_val_loss:
+                            best_val_loss = val_loss
+                            self.save_model(f"{self.output_dir}/best_model")
+                            print(f"Model saved with validation loss: {val_loss:.4f}")
+                    
+                    global_step += 1
+                    
+                    # Check if max steps reached
+                    if self.max_steps and global_step >= self.max_steps:
+                        break
+            
+            # Calculate average training loss for the epoch
+            avg_train_loss = train_loss / len(self.train_dataloader)
+            
+            # Validation at the end of each epoch
+            if self.val_dataset:
+                val_loss = self.evaluate()
+                print(f"Epoch {epoch+1}/{self.num_train_epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}")
+                
+                # Save best model
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    self.save_model(f"{self.output_dir}/best_model")
+                    print(f"Model saved with validation loss: {val_loss:.4f}")
+            else:
+                print(f"Epoch {epoch+1}/{self.num_train_epochs} - Train Loss: {avg_train_loss:.4f}")
+            
+            # Save checkpoint
+            self.save_model(f"{self.output_dir}/checkpoint_epoch_{epoch+1}")
+        
+        # Save final model
+        self.save_model(f"{self.output_dir}/final_model")
+        
+        return stats
+    
+    def evaluate(self):
+        """Evaluate the model on the validation dataset"""
+        self.model.eval()
+        val_loss = 0.0
+        
+        with torch.no_grad():
+            for batch in self.val_dataloader:
+                # Get batch data
+                locations, texts = batch
+                
+                # Move to device
+                locations = locations.to(device)
+                
+                # Forward pass
+                features = self.model(locations, texts)
+                
+                # Compute loss
+                similarity = features @ features.t()
+                targets = torch.arange(similarity.size(0)).to(device)
+                loss = F.cross_entropy(similarity, targets)
+                
+                # Update validation loss
+                val_loss += loss.item()
+        
+        # Calculate average validation loss
+        val_loss = val_loss / len(self.val_dataloader)
+        
+        # Set model back to training mode
+        self.model.train()
+        
+        return val_loss
+    
+    def save_model(self, path):
+        """Save the model weights"""
+        # Create directory if it doesn't exist
+        os.makedirs(path, exist_ok=True)
+        
+        # Save model state dict
+        torch.save(self.model.state_dict(), f"{path}/model.pth")
+        
+        # Save tokenizer
+        self.tokenizer.save_pretrained(path)
+
+# Create sample data function
+def create_sample_data(config):
+    """Create sample CSV files with location-text pairs"""
+    # Define sample landmarks
+    landmarks = [
+        {"name": "Eiffel Tower", "lat": 48.8584, "lon": 2.2945, 
+         "desc": "A iron tower located in Paris, France"},
+        {"name": "Statue of Liberty", "lat": 40.6892, "lon": -74.0445,
+         "desc": "A copper statue located in New York Harbor"},
+        {"name": "Great Wall", "lat": 40.4319, "lon": 116.5704,
+         "desc": "Ancient fortifications in northern China"},
+        {"name": "Pyramids", "lat": 29.9792, "lon": 31.1342,
+         "desc": "Ancient structures in Giza, Egypt"},
+        {"name": "Taj Mahal", "lat": 27.1751, "lon": 78.0421,
+         "desc": "White marble mausoleum in Agra, India"}
+    ]
+    
+    # Create variations for training data
+    train_data = []
+    for landmark in landmarks:
+        # Original description
+        train_data.append({
+            "lat": landmark["lat"],
+            "lon": landmark["lon"],
+            "description": landmark["desc"]
+        })
+        
+        # Variations
+        train_data.append({
+            "lat": landmark["lat"],
+            "lon": landmark["lon"],
+            "description": f"Where is {landmark['name']}?"
+        })
+        
+        train_data.append({
+            "lat": landmark["lat"],
+            "lon": landmark["lon"],
+            "description": f"Find {landmark['name']} on a map"
+        })
+    
+    # Validation data
+    val_data = []
+    for landmark in landmarks[:3]:
+        val_data.append({
+            "lat": landmark["lat"],
+            "lon": landmark["lon"],
+            "description": f"Navigate to {landmark['name']}"
+        })
+    
+    # Save data
+    train_df = pd.DataFrame(train_data)
+    val_df = pd.DataFrame(val_data)
+    
+    train_df.to_csv(config.TRAIN_CSV, index=False)
+    val_df.to_csv(config.VAL_CSV, index=False)
+    
+    print(f"Created {len(train_df)} training samples and {len(val_df)} validation samples")
+
+def main():
+    """Main function"""
+    # Set random seeds
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    
+    # Create output directory
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+    
+    # Create sample data if it doesn't exist
+    if not os.path.exists(config.TRAIN_CSV) or not os.path.exists(config.VAL_CSV):
+        create_sample_data(config)
+    
+    # Load datasets
+    train_dataset = GeoTextDataset(config.TRAIN_CSV)
+    val_dataset = GeoTextDataset(config.VAL_CSV)
+    
+    # Create model
+    model = TextEnhancedGeoCLIP().to(device)
+    
+    # Create trainer
+    trainer = GeoCLIPTrainer(
+        model=model,
+        tokenizer=model.tokenizer,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        per_device_train_batch_size=config.PER_DEVICE_BATCH_SIZE,
+        gradient_accumulation_steps=config.GRADIENT_ACCUMULATION_STEPS,
+        learning_rate=config.LEARNING_RATE,
+        weight_decay=config.WEIGHT_DECAY,
+        max_steps=config.MAX_STEPS,
+        num_train_epochs=config.NUM_EPOCHS,
+        warmup_steps=config.WARMUP_STEPS,
+        logging_steps=config.LOGGING_STEPS,
+        eval_steps=config.EVAL_STEPS,
+        output_dir=config.OUTPUT_DIR,
+        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported()
+    )
+    
+    # Train model
+    print("Starting training...")
+    training_stats = trainer.train()
+    print("Training complete!")
+
+if __name__ == "__main__":
+    main()
