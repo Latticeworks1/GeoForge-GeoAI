@@ -1,0 +1,709 @@
+# === IMPORTS ===
+
+import os
+
+import sys
+
+import subprocess
+
+import importlib.util
+
+import shutil # For checking ffmpeg
+
+import torch
+
+import numpy as np
+
+import matplotlib.pyplot as plt
+
+import soundfile as sf
+
+import librosa
+
+import librosa.display
+
+import hashlib
+
+from datetime import datetime
+
+from IPython.display import Audio, display
+
+import json
+
+import warnings
+
+warnings.filterwarnings('ignore')
+
+import scipy # For median_filter
+
+  
+
+# === CONFIG ===
+
+# --- Bark Config ---
+
+TEXT_PROMPT = "[rap]The future of artificial intelligence lies in multimodal understanding. Audio deepfakes are on the rise."
+
+VOICE_MODEL = "v2/en_speaker_6" # Example: "v2/en_speaker_6", "v2/fr_speaker_2"
+
+ENABLE_AUDIO_PLAYBACK = True
+
+ENABLE_FILE_LOGGING = True
+
+FORCE_REGENERATE = False # Set to True to re-generate audio even if files exist
+
+OUTPUT_DIR = "/content/outputs"
+
+  
+
+# --- Librosa Analysis Config ---
+
+SAMPLE_RATE = 24000 # Target sample rate for librosa analysis (Bark's native is 24000)
+
+N_MELS = 128
+
+HOP_LENGTH = 512
+
+N_FFT = 2048
+
+FMAX = 8000 # Max frequency for Mel spectrogram
+
+  
+
+# --- Chroma Analysis Config ---
+
+CQT_BINS_PER_OCTAVE = 12 * 3
+
+CQT_N_BINS = 7 * CQT_BINS_PER_OCTAVE
+
+HARMONIC_MARGIN = 8
+
+CHROMA_SMOOTH_SIZE = (1, 9)
+
+  
+
+# --- Whisper Transcription Config ---
+
+ENABLE_TRANSCRIPTION = True
+
+WHISPER_MODEL_NAME = "base.en" # tiny.en, tiny, base.en, base, small.en, small, medium.en, medium, large-v1, large-v2, large-v3
+
+WHISPER_LANGUAGE = None # Specify language code (e.g., "en", "es"). None for auto-detection by Whisper.
+
+WHISPER_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+  
+
+# === DIR PRE-CHECK ===
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+  
+
+# === HASH PROMPT ===
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+prompt_hash = hashlib.md5(TEXT_PROMPT.encode()).hexdigest()[:8]
+
+clean_prompt = "".join(c for c in TEXT_PROMPT.lower() if c.isalnum() or c in " -")[:30].replace(" ", "-")
+
+base_filename = f"{timestamp}_{prompt_hash}_{clean_prompt}"
+
+  
+
+# === DEPENDENCY INSTALL ===
+
+def check_and_install(package_name, import_name=None, version_spec=""):
+
+if import_name is None:
+
+import_name = package_name
+
+if importlib.util.find_spec(import_name) is None:
+
+print(f"Attempting to install {package_name}{version_spec}...")
+
+subprocess.run([sys.executable, "-m", "pip", "install", f"{package_name}{version_spec}"], check=True)
+
+# Re-check after install
+
+if importlib.util.find_spec(import_name) is None:
+
+print(f"Installation of {package_name} might have succeeded but import name {import_name} not found. Manual check may be needed.")
+
+else:
+
+print(f"✅ {package_name} installed successfully.")
+
+else:
+
+print(f"✅ {package_name} (as {import_name}) already installed.")
+
+  
+
+check_and_install("bark-voice-clone", "bark") # Using bark-voice-clone as it includes bark
+
+check_and_install("scipy", "scipy")
+
+if ENABLE_TRANSCRIPTION:
+
+check_and_install("openai-whisper", "whisper")
+
+  
+
+# === FFMPEG CHECK for WHISPER ===
+
+if ENABLE_TRANSCRIPTION:
+
+if shutil.which("ffmpeg") is None:
+
+print("⚠️ WARNING: ffmpeg is not installed or not in PATH. Whisper transcription relies on ffmpeg for audio processing.")
+
+print("Please install ffmpeg: https://ffmpeg.org/download.html")
+
+# You might want to disable transcription if ffmpeg is critical and not found:
+
+# ENABLE_TRANSCRIPTION = False
+
+else:
+
+print("✅ ffmpeg found in PATH.")
+
+  
+
+# === TORCH LOAD PATCH (SAFE & RECURSION-PROOF) ===
+
+if not getattr(torch.load, "__bark_patched", False):
+
+print("Patching torch.load for Bark/Whisper compatibility...")
+
+original_torch_load = torch.load
+
+def patched_torch_load(*args, **kwargs):
+
+kwargs["weights_only"] = False
+
+return original_torch_load(*args, **kwargs)
+
+patched_torch_load.__bark_patched = True
+
+torch.load = patched_torch_load
+
+print("✅ Patched torch.load (weights_only=False)")
+
+else:
+
+print("ℹ️ torch.load already patched.")
+
+  
+
+# === BARK ===
+
+from bark import generate_audio, preload_models
+
+from bark.generation import SAMPLE_RATE as BARK_SAMPLE_RATE # Explicit import
+
+  
+
+if not getattr(preload_models, "_bark_models_preloaded", False):
+
+print("Preloading Bark models...")
+
+preload_models(text_use_gpu=torch.cuda.is_available(), coarse_use_gpu=torch.cuda.is_available(), fine_use_gpu=torch.cuda.is_available(), codec_use_gpu=torch.cuda.is_available())
+
+setattr(preload_models, "_bark_models_preloaded", True)
+
+print("✅ Bark models loaded")
+
+else:
+
+print("ℹ️ Bark models previously loaded.")
+
+  
+
+# === WHISPER MODEL LOAD ===
+
+whisper_model_instance = None
+
+if ENABLE_TRANSCRIPTION:
+
+try:
+
+import whisper # Ensure it's imported after check_and_install
+
+if not hasattr(whisper, "_model_instance_loaded_flag") or getattr(whisper, "_loaded_model_name") != WHISPER_MODEL_NAME:
+
+print(f"Loading Whisper model: {WHISPER_MODEL_NAME} on device: {WHISPER_DEVICE}")
+
+# download_root can be specified if needed, e.g., os.path.join(OUTPUT_DIR, "whisper_models")
+
+whisper_model_instance = whisper.load_model(WHISPER_MODEL_NAME, device=WHISPER_DEVICE)
+
+setattr(whisper, "_model_instance_loaded_flag", True)
+
+setattr(whisper, "_loaded_model_name", WHISPER_MODEL_NAME) # Store name to check if model changed
+
+setattr(whisper, "_model_instance_ref", whisper_model_instance) # Store ref
+
+print(f"✅ Whisper model '{WHISPER_MODEL_NAME}' loaded.")
+
+else:
+
+whisper_model_instance = getattr(whisper, "_model_instance_ref")
+
+print(f"ℹ️ Whisper model '{WHISPER_MODEL_NAME}' previously loaded and reused.")
+
+except ImportError:
+
+print("❌ Whisper library not found, disabling transcription.")
+
+ENABLE_TRANSCRIPTION = False
+
+except Exception as e:
+
+print(f"❌ Error loading Whisper model: {e}")
+
+ENABLE_TRANSCRIPTION = False
+
+  
+
+# === AUDIO FILE (BARK) ===
+
+audio_filename = f"{base_filename}.wav"
+
+audio_path = os.path.join(OUTPUT_DIR, audio_filename)
+
+  
+
+if os.path.exists(audio_path) and not FORCE_REGENERATE:
+
+print(f"ℹ️ Bark audio already exists at: {audio_path}")
+
+else:
+
+print(f"🎤 Generating Bark audio for: {TEXT_PROMPT}")
+
+# Generate with Bark's native sample rate
+
+audio_array_bark = generate_audio(TEXT_PROMPT, history_prompt=VOICE_MODEL)
+
+assert isinstance(audio_array_bark, np.ndarray) and audio_array_bark.ndim == 1 and len(audio_array_bark) > 0
+
+sf.write(audio_path, audio_array_bark, BARK_SAMPLE_RATE)
+
+print(f"✅ Bark audio written to: {audio_path} (Sample Rate: {BARK_SAMPLE_RATE})")
+
+  
+
+# === TRANSCRIPTION (WHISPER) ===
+
+transcribed_text = None
+
+transcription_segments = None
+
+detected_language_whisper = None
+
+transcription_output_path = None
+
+  
+
+if ENABLE_TRANSCRIPTION and os.path.exists(audio_path) and whisper_model_instance:
+
+print(f"🎤 Transcribing audio using Whisper ({WHISPER_MODEL_NAME})...")
+
+try:
+
+transcribe_options = {"fp16": (WHISPER_DEVICE == "cuda")}
+
+if WHISPER_LANGUAGE: # Only add if specified, otherwise Whisper auto-detects
+
+transcribe_options["language"] = WHISPER_LANGUAGE
+
+result = whisper_model_instance.transcribe(audio_path, **transcribe_options)
+
+transcribed_text = result["text"]
+
+transcription_segments = result["segments"] # For more detailed analysis if needed
+
+detected_language_whisper = result["language"]
+
+print(f"🗣️ Detected language (Whisper): {detected_language_whisper.upper()}")
+
+print(f"📝 Transcription: {transcribed_text}")
+
+  
+
+transcription_output_filename = f"{base_filename}_transcription.txt"
+
+transcription_output_path = os.path.join(OUTPUT_DIR, transcription_output_filename)
+
+with open(transcription_output_path, "w", encoding="utf-8") as f:
+
+f.write(f"Prompt: {TEXT_PROMPT}\n")
+
+f.write(f"Whisper Model: {WHISPER_MODEL_NAME}\n")
+
+f.write(f"Detected Language: {detected_language_whisper.upper()}\n\n")
+
+f.write(transcribed_text)
+
+print(f"✅ Transcription saved to: {transcription_output_path}")
+
+  
+
+except Exception as e:
+
+print(f"❌ Error during Whisper transcription: {e}")
+
+transcribed_text = f"Error during transcription: {str(e)}"
+
+else:
+
+if ENABLE_TRANSCRIPTION and not whisper_model_instance:
+
+print("❌ Whisper model not available. Skipping transcription.")
+
+elif ENABLE_TRANSCRIPTION and not os.path.exists(audio_path):
+
+print(f"❌ Audio file not found at {audio_path}. Skipping transcription.")
+
+  
+  
+
+# === ANALYSIS (Librosa) ===
+
+print(f"🔍 Loading and analyzing audio: {audio_path} for Librosa features.")
+
+# Load audio for librosa analysis, resample if needed to our target SAMPLE_RATE
+
+y, sr = librosa.load(audio_path, sr=SAMPLE_RATE)
+
+print(f" Librosa loaded audio at {sr} Hz with {len(y)} samples.")
+
+  
+  
+
+# --- Original Analysis (Mel Spec, Tempo, Beats) ---
+
+tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP_LENGTH)
+
+tempo = float(tempo) if hasattr(tempo, "item") else tempo
+
+beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=HOP_LENGTH)
+
+mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS, fmax=FMAX)
+
+log_mel = librosa.power_to_db(mel_spec, ref=np.max)
+
+  
+
+# --- Additional Chroma Analysis ---
+
+print("🎼 Performing Chroma analysis...")
+
+C = np.abs(librosa.cqt(y=y, sr=sr, bins_per_octave=CQT_BINS_PER_OCTAVE, n_bins=CQT_N_BINS, hop_length=HOP_LENGTH))
+
+C_db = librosa.amplitude_to_db(C, ref=np.max)
+
+chroma_cqt_orig = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=HOP_LENGTH, C=C)
+
+print(" tách harmonic component...")
+
+y_harm = librosa.effects.harmonic(y=y, margin=HARMONIC_MARGIN)
+
+chroma_harm = librosa.feature.chroma_cqt(y=y_harm, sr=sr, hop_length=HOP_LENGTH)
+
+print("Applying non-local filtering to harmonic chroma...")
+
+chroma_filter = np.minimum(chroma_harm,
+
+librosa.decompose.nn_filter(chroma_harm,
+
+aggregate=np.median,
+
+metric='cosine'))
+
+print("Applying median smoothing...")
+
+chroma_smooth = scipy.ndimage.median_filter(chroma_filter, size=CHROMA_SMOOTH_SIZE)
+
+chroma_stft = librosa.feature.chroma_stft(y=y, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH)
+
+chroma_cens = librosa.feature.chroma_cens(y=y, sr=sr, hop_length=HOP_LENGTH, C=C)
+
+print("✅ Chroma analysis complete.")
+
+  
+
+# === VISUALIZATION ===
+
+plot_title_suffix = f' – "{TEXT_PROMPT[:30]}..."'
+
+  
+
+plt.figure(figsize=(12, 6))
+
+librosa.display.specshow(log_mel, sr=sr, hop_length=HOP_LENGTH, x_axis="time", y_axis="mel", fmax=FMAX)
+
+plt.vlines(beat_times, 0, N_MELS, color="white", linestyle="--", linewidth=1.2)
+
+plt.title(f'Mel Spectrogram @ {tempo:.1f} BPM{plot_title_suffix}')
+
+plt.colorbar(format="%+2.0f dB")
+
+plt.tight_layout()
+
+mel_viz_path = os.path.join(OUTPUT_DIR, f"{base_filename}_mel_spec.png")
+
+plt.savefig(mel_viz_path, dpi=150)
+
+print(f"📊 Mel Spectrogram saved to: {mel_viz_path}")
+
+  
+
+plt.figure(figsize=(12, 6))
+
+librosa.display.specshow(C_db, sr=sr, hop_length=HOP_LENGTH, x_axis='time', y_axis='cqt_note', bins_per_octave=CQT_BINS_PER_OCTAVE)
+
+plt.title(f'CQT Spectrogram{plot_title_suffix}')
+
+plt.colorbar(format="%+2.0f dB")
+
+plt.tight_layout()
+
+cqt_viz_path = os.path.join(OUTPUT_DIR, f"{base_filename}_cqt_spec.png")
+
+plt.savefig(cqt_viz_path, dpi=150)
+
+print(f"📊 CQT Spectrogram saved to: {cqt_viz_path}")
+
+  
+
+def plot_chromagram(chroma_data, title, file_suffix, sr_val, hop_length_val, current_plot_title_suffix):
+
+plt.figure(figsize=(12, 4))
+
+librosa.display.specshow(chroma_data, sr=sr_val, hop_length=hop_length_val, y_axis='chroma', x_axis='time')
+
+plt.title(title + current_plot_title_suffix)
+
+plt.colorbar()
+
+plt.tight_layout()
+
+path = os.path.join(OUTPUT_DIR, f"{base_filename}_{file_suffix}.png")
+
+plt.savefig(path, dpi=150)
+
+print(f"📊 {title} saved to: {path}")
+
+return path
+
+  
+
+chroma_cqt_orig_viz_path = plot_chromagram(chroma_cqt_orig, "Original Chroma CQT", "chroma_cqt_orig", sr, HOP_LENGTH, plot_title_suffix)
+
+chroma_harm_viz_path = plot_chromagram(chroma_harm, "Harmonic Chroma CQT", "chroma_cqt_harm", sr, HOP_LENGTH, plot_title_suffix)
+
+chroma_filter_viz_path = plot_chromagram(chroma_filter, "Non-Local Filtered Chroma", "chroma_cqt_nl_filter", sr, HOP_LENGTH, plot_title_suffix)
+
+chroma_smooth_viz_path = plot_chromagram(chroma_smooth, "Smoothed (Median Filtered) Chroma", "chroma_cqt_smooth", sr, HOP_LENGTH, plot_title_suffix)
+
+chroma_stft_viz_path = plot_chromagram(chroma_stft, "Chroma STFT", "chroma_stft", sr, HOP_LENGTH, plot_title_suffix)
+
+chroma_cens_viz_path = plot_chromagram(chroma_cens, "Chroma CENS", "chroma_cens", sr, HOP_LENGTH, plot_title_suffix)
+
+  
+
+fig, ax = plt.subplots(nrows=3, sharex=True, figsize=(12, 10))
+
+librosa.display.specshow(chroma_cqt_orig, y_axis='chroma', x_axis='time', sr=sr, hop_length=HOP_LENGTH, ax=ax[0])
+
+ax[0].set(ylabel='Original CQT Chroma')
+
+ax[0].set_title(f"Chroma Comparison{plot_title_suffix}")
+
+ax[0].label_outer()
+
+librosa.display.specshow(chroma_smooth, y_axis='chroma', x_axis='time', sr=sr, hop_length=HOP_LENGTH, ax=ax[1])
+
+ax[1].set(ylabel='Smoothed Chroma')
+
+ax[1].label_outer()
+
+librosa.display.specshow(chroma_cens, y_axis='chroma', x_axis='time', sr=sr, hop_length=HOP_LENGTH, ax=ax[2])
+
+ax[2].set(ylabel='CENS Chroma')
+
+fig.tight_layout()
+
+chroma_comparison_viz_path = os.path.join(OUTPUT_DIR, f"{base_filename}_chroma_comparison.png")
+
+plt.savefig(chroma_comparison_viz_path, dpi=150)
+
+print(f"📊 Chroma Comparison plot saved to: {chroma_comparison_viz_path}")
+
+  
+
+if 'ipykernel' in sys.modules or 'google.colab' in sys.modules:
+
+plt.show() # Show all plots at once
+
+else:
+
+plt.close('all') # Close all figures to free memory if not in interactive environment
+
+  
+
+# === LOGGING ===
+
+if ENABLE_FILE_LOGGING:
+
+log_file = os.path.join(OUTPUT_DIR, "experiment_log.json")
+
+log_entry = {
+
+"timestamp": timestamp,
+
+"text_prompt": TEXT_PROMPT,
+
+"prompt_hash": prompt_hash,
+
+"bark_voice_model": VOICE_MODEL,
+
+"bark_audio_path": audio_path,
+
+"bark_audio_duration_sec": len(y) / sr if 'y' in locals() and y is not None and sr > 0 else 0, # duration from librosa loaded audio
+
+"bark_native_sample_rate": BARK_SAMPLE_RATE,
+
+"librosa_analysis_sample_rate": sr if 'sr' in locals() else None,
+
+"librosa_analysis_params": {
+
+"hop_length": HOP_LENGTH,
+
+"n_fft": N_FFT,
+
+"n_mels": N_MELS,
+
+"fmax_mel": FMAX,
+
+"cqt_bins_per_octave": CQT_BINS_PER_OCTAVE,
+
+"cqt_n_bins": CQT_N_BINS,
+
+"harmonic_margin": HARMONIC_MARGIN,
+
+"chroma_smooth_size": CHROMA_SMOOTH_SIZE,
+
+},
+
+"mel_image_path": mel_viz_path,
+
+"tempo_bpm": tempo,
+
+"beats_detected": len(beat_times),
+
+"beat_times_sec": beat_times.tolist() if isinstance(beat_times, np.ndarray) else beat_times,
+
+"visualization_paths": {
+
+"cqt_spectrogram": cqt_viz_path,
+
+"chroma_cqt_original": chroma_cqt_orig_viz_path,
+
+"chroma_cqt_harmonic": chroma_harm_viz_path,
+
+"chroma_cqt_filtered": chroma_filter_viz_path,
+
+"chroma_cqt_smoothed": chroma_smooth_viz_path,
+
+"chroma_stft": chroma_stft_viz_path,
+
+"chroma_cens": chroma_cens_viz_path,
+
+"chroma_comparison": chroma_comparison_viz_path,
+
+}
+
+}
+
+  
+
+if ENABLE_TRANSCRIPTION:
+
+log_entry["whisper_transcription_details"] = {
+
+"whisper_model_name": WHISPER_MODEL_NAME,
+
+"whisper_input_language_config": WHISPER_LANGUAGE if WHISPER_LANGUAGE else "auto-detect",
+
+"whisper_detected_language": detected_language_whisper,
+
+"transcribed_text": transcribed_text,
+
+"transcription_file_path": transcription_output_path,
+
+# "transcription_segments": transcription_segments, # Optional: can be very verbose
+
+}
+
+  
+
+log_data = []
+
+if os.path.exists(log_file):
+
+try:
+
+with open(log_file, "r") as f:
+
+log_data = json.load(f)
+
+if not isinstance(log_data, list):
+
+print(f"⚠️Warning: Log file {log_file} content was not a list. Resetting.")
+
+log_data = []
+
+except json.JSONDecodeError:
+
+print(f"⚠️Warning: Log file {log_file} was corrupted or empty. Resetting.")
+
+log_data = []
+
+log_data.append(log_entry)
+
+with open(log_file, "w") as f:
+
+json.dump(log_data, f, indent=2)
+
+print(f"📜 Log updated: {log_file}")
+
+  
+
+# === AUDIO CHECK (Playback) ===
+
+if ENABLE_AUDIO_PLAYBACK:
+
+if 'y' in locals() and y is not None and sr > 0: # Check if y and sr are defined
+
+print(f"🔊 Playing Bark audio (loaded by librosa at {sr} Hz for analysis):")
+
+display(Audio(data=y, rate=sr))
+
+elif os.path.exists(audio_path): # Fallback if y/sr not loaded from analysis
+
+print(f"🔊 Playing original Bark audio from file at {BARK_SAMPLE_RATE} Hz:")
+
+display(Audio(filename=audio_path, rate=BARK_SAMPLE_RATE))
+
+else:
+
+print(f"❌ Audio file not found at {audio_path} for playback.")
+
+  
+
+print("✨ Script finished.")
