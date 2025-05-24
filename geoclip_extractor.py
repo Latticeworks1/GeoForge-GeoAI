@@ -8,6 +8,7 @@ GeoCLIP Incremental Data Extractor
 
 import os
 import hashlib
+import argparse # Added argparse
 import pandas as pd
 from pathlib import Path
 from PIL import Image
@@ -25,7 +26,7 @@ except ImportError:
 # Configuration (customize these)
 ROOT = Path("data")                     # Root directory for images
 MASTER = Path("metadata/master.csv")    # Master index file
-HF_REPO = "your-username/geoclip-dataset"  # HuggingFace repo name
+# HF_REPO is now set via command-line argument or in main()
 
 def sha256(path):
     """Generate hash for a file to track changes"""
@@ -165,22 +166,23 @@ def push_to_hf(new_rows, private=True):
         return False
     
     # Upload to HuggingFace
+    # HF_REPO will be the global variable set by main() or command-line arg
     print(f"Uploading {len(upload_df)} new images to '{HF_REPO}'...")
     ds.push_to_hub(HF_REPO, private=private)
     
     print(f"✅ Data uploaded to: https://huggingface.co/datasets/{HF_REPO}")
     return True
 
-def main(root_dir=None, master_file=None, hf_repo=None, upload=True, private=True):
+def main(root_dir=None, master_file=None, upload=True, private=True, hf_repo_arg=None):
     """Main entry point with configurable parameters"""
     # Update global configuration if specified
-    global ROOT, MASTER, HF_REPO
+    global ROOT, MASTER, HF_REPO 
     if root_dir:
         ROOT = Path(root_dir)
     if master_file:
         MASTER = Path(master_file)
-    if hf_repo:
-        HF_REPO = hf_repo
+    # Set HF_REPO from argument or default
+    HF_REPO = hf_repo_arg if hf_repo_arg else "your-username/geoclip-dataset"
     
     # Process images
     df, new_rows, geoclip_path = ingest()
@@ -204,31 +206,41 @@ def main(root_dir=None, master_file=None, hf_repo=None, upload=True, private=Tru
     return df, new_rows, geoclip_path
 
 if __name__ == "__main__":
-    # You can customize these parameters
+    parser = argparse.ArgumentParser(description="GeoCLIP Incremental Data Extractor")
+    parser.add_argument("--root_dir", type=str, default="data", help="Root directory for images")
+    parser.add_argument("--master_file", type=str, default="metadata/master.csv", help="Master index file path")
+    parser.add_argument("--hf_repo", type=str, default="your-username/geoclip-dataset", help="HuggingFace repository name (e.g., your-username/geoclip-dataset)")
+    parser.add_argument("--no_upload", action="store_false", dest="upload", help="Disable uploading to HuggingFace")
+    parser.add_argument("--public", action="store_false", dest="private", help="Make the HuggingFace dataset public (default is private)")
+    
+    args = parser.parse_args()
+
+    # Call main with parsed arguments
     main(
-        root_dir="data",                     # Root directory for images
-        master_file="metadata/master.csv",   # Master index file
-        hf_repo="your-username/geoclip-dataset",  # HuggingFace repo name
-        upload=True,                         # Whether to upload to HuggingFace
-        private=True                         # Whether the HuggingFace dataset is private
+        root_dir=args.root_dir,
+        master_file=args.master_file,
+        hf_repo_arg=args.hf_repo, # Pass the hf_repo argument here
+        upload=args.upload,
+        private=args.private
     )
 
-# Example usage in a notebook:
-# from geoclip_extractor import main
-# df, new_rows, geoclip_path = main(
-#     root_dir="/content/drive/MyDrive/images",
-#     master_file="/content/drive/MyDrive/metadata/master.csv",
-#     hf_repo="your-username/geoclip-dataset"
-# )
-
-
-# Run with default parameters (from command line)
-!python geoclip_extractor.py
-#dont forget your hf hub login or key if needed 
-# Or customize in a notebook
-from geoclip_extractor import main
-df, new_rows, geoclip_path = main(
-    root_dir="/content/drive/MyDrive/theo2",
-    master_file="/content/drive/MyDrive/metadata/master.csv",
-    hf_repo="latterworks/geoclip-dataset"
-)
+    # Example usage:
+    # To run with custom parameters, you can uncomment and modify the following lines.
+    # This shows how you might call main if you were importing it as a module.
+    #
+    # from geoclip_extractor import main
+    # df, new_rows, geoclip_path = main(
+    #     root_dir="/content/drive/MyDrive/images",
+    #     master_file="/content/drive/MyDrive/metadata/master.csv",
+    #     hf_repo_arg="your-username/custom-repo", # Pass hf_repo_arg here
+    #     upload=True,
+    #     private=False
+    # )
+    #
+    # # Example of the moved and commented out code:
+    # # from geoclip_extractor import main
+    # # df, new_rows, geoclip_path = main(
+    # #     root_dir="/content/drive/MyDrive/theo2",
+    # #     master_file="/content/drive/MyDrive/metadata/master.csv",
+    # #     hf_repo_arg="latterworks/geoclip-dataset" # Pass hf_repo_arg here
+    # # )
