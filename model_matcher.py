@@ -10,23 +10,19 @@ import httpx
 import json
 from typing import List, Dict, Union
 import nest_asyncio
-import asyncio
+import argparse # Added argparse
+# asyncio is imported below, removing the redundant one here.
 
-# Define query and host before using them
-query = "Summarize what SmolaAgents is in 2 sentences."  # Define query here
-ip_models, ip_model_embeddings, fuzzy_model = load_and_cache_index()
-query_model = "deepseek"
-result = search_best_model(query_model, ip_model_embeddings, fuzzy_model, threshold=0.7)
-if result is None:
-    print("No matching model found above the threshold.")
-else:
-    matched_ip, matched_model, sim = result
-    print(f"Matched IP: {matched_ip}, Model: {matched_model} (Similarity: {sim:.3f})")
-    host = f"http://{matched_ip}:11434"  # Define host here
+# Global cache variables, initialized to None
+_IP_MODELS = None
+_IP_MODEL_EMBEDDINGS = None
+_FUZZY_MODEL = None
+
+# Define query here, can be overridden in main() or passed as argument
+query = "Summarize what SmolaAgents is in 2 sentences." # This can remain a global default for the prompt
 
 
-
-def load_and_cache_index(dataset_name: str = "latterworks/instances", split: str = "train"):
+def load_and_cache_index(dataset_name: str, split: str, sentence_transformer_model_name: str):
     """
     Load the dataset once and build a cached index mapping each IP to its list of model names and
     precomputed embeddings for fuzzy matching.
@@ -43,8 +39,9 @@ def load_and_cache_index(dataset_name: str = "latterworks/instances", split: str
         ips = train_dataset["IP"]
         models_lists = train_dataset["Models"]
 
-        # Load the transformer once for fuzzy matching.
-        _FUZZY_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+        # Load the transformer once for fuzzy matching, using the provided model name.
+        print(f"Loading SentenceTransformer model: {sentence_transformer_model_name}")
+        _FUZZY_MODEL = SentenceTransformer(sentence_transformer_model_name)
         _IP_MODELS = {ip: model_list for ip, model_list in zip(ips, models_lists)}
         _IP_MODEL_EMBEDDINGS = {}
         for ip, model_list in _IP_MODELS.items():
@@ -213,35 +210,58 @@ async def main_async_stream(model: str, query: str, host: str):
         print("Synchronous response:", sync_response)
 
 
-def main():
+def main(args):
     # Load the dataset and build the index once (cached globally)
-    ip_models, ip_model_embeddings, fuzzy_model = load_and_cache_index()
+    global _IP_MODELS, _IP_MODEL_EMBEDDINGS, _FUZZY_MODEL # Ensure we are using the global cache
+    
+    # Load and cache index - this call populates the global variables
+    # Pass dataset_name, split, and sentence_transformer_model from args
+    ip_models, ip_model_embeddings, fuzzy_model = load_and_cache_index(
+        dataset_name=args.dataset_name,
+        split=args.split,
+        sentence_transformer_model_name=args.sentence_transformer_model
+    )
 
-    # Perform a fuzzy search for the desired model (e.g., "llama","deepseek","smolagents. and get matched to the precise model name like "llama3.1:latest)
-    query_model = "llama3.1"
-    result = search_best_model(query_model, ip_model_embeddings, fuzzy_model, threshold=0.7)
+    # Perform a fuzzy search for the desired model using args.initial_search_model
+    result = search_best_model(args.initial_search_model, ip_model_embeddings, fuzzy_model, threshold=0.7) # Threshold could also be an arg
+    
     if result is None:
-        print("No matching model found above the threshold.")
+        print(f"No matching model found for '{args.initial_search_model}' above the threshold.")
+        print("Cannot proceed without a matched model and host.")
         return
 
     matched_ip, matched_model, sim = result
-    print(f"Matched IP: {matched_ip}, Model: {matched_model} (Similarity: {sim:.3f})")
-    host = f"http://{matched_ip}:11434"
+    print(f"Matched IP: {matched_ip}, Model: {matched_model} for query '{args.initial_search_model}' (Similarity: {sim:.3f})")
+    host = f"http://{matched_ip}:11434" # Port could also be an arg
 
-    # Prepare the query message
-    query = "Summarize what SmolaAgents is in 2 sentences."
+    # Use the global 'query' for the actual summarization task, or make it an arg too
+    current_query_for_ollama = query 
+    if args.ollama_query: # Allow overriding the global query via CLI
+        current_query_for_ollama = args.ollama_query
+    
+    print(f"Using Ollama query: \"{current_query_for_ollama}\"")
 
     # First, try a synchronous call
     try:
-        sync_reply = call_ollama_chat(matched_ip, matched_model, [{"role": "user", "content": query}])
+        sync_reply = call_ollama_chat(matched_ip, matched_model, [{"role": "user", "content": current_query_for_ollama}])
         print("Synchronous Chat response:", sync_reply)
     except RuntimeError as e:
-        print(e)
+        print(f"Error during synchronous call: {e}")
 
     # Then, attempt asynchronous streaming with auto-fallback
-    asyncio.run(main_async_stream(matched_model, query, host))
-
+    # Ensure nest_asyncio is applied if running in a notebook-like environment
+    if 'nest_asyncio' in globals():
+        nest_asyncio.apply()
+    asyncio.run(main_async_stream(matched_model, current_query_for_ollama, host))
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Model Matcher: Find and interact with Ollama models.")
+    parser.add_argument("--dataset_name", type=str, default="latterworks/instances", help="Name of the Hugging Face dataset to load for IP and model indexing.")
+    parser.add_argument("--split", type=str, default="train", help="Dataset split to use (e.g., 'train', 'test').")
+    parser.add_argument("--initial_search_model", type=str, default="deepseek", help="Name of the model to search for initially to find a host.")
+    parser.add_argument("--sentence_transformer_model", type=str, default="all-MiniLM-L6-v2", help="Name of the SentenceTransformer model to use for fuzzy matching.")
+    parser.add_argument("--ollama_query", type=str, default=query, help="The query to send to the matched Ollama model.") # Uses global query as default
+    
+    args = parser.parse_args()
+    main(args)
